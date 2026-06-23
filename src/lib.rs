@@ -616,7 +616,10 @@ pub fn format_float(value: f64, spec: &str) -> R<String> {
         }
     };
 
-    if value.is_nan() || value.is_infinite() {
+    // The '%' type multiplies by 100, which can overflow a large finite value to infinity;
+    // CPython formats that as inf, not as a grouped/padded "inf" digit run.
+    let pct_overflow = ty == Some('%') && value.is_finite() && (value.abs() * 100.0).is_infinite();
+    if value.is_nan() || value.is_infinite() || pct_overflow {
         let mut word = if value.is_nan() { "nan" } else { "inf" }.to_string();
         if upper {
             word = word.to_uppercase();

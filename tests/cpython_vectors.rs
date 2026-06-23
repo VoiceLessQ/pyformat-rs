@@ -165,6 +165,46 @@ fn str_format_mechanics() {
     assert_eq!(str_format("{}", &[Value::None], &[]).unwrap(), "None");
 }
 
+// test_str.py: test_format (positional, escapes, str spec edges, fill chars, huge width)
+#[test]
+fn str_format_cpython_rows() {
+    let s = |t: &str| Value::Str(t.to_string());
+    let sf = |t: &str, a: &[Value]| str_format(t, a, &[]).unwrap();
+
+    assert_eq!(sf("", &[]), "");
+    assert_eq!(sf("{0}", &[s("abc")]), "abc");
+    assert_eq!(sf("{0:}", &[s("abc")]), "abc");
+    assert_eq!(sf("X{0}Y", &[s("abc")]), "XabcY");
+    assert_eq!(sf("{1}", &[Value::Int(1), s("abc")]), "abc");
+    assert_eq!(sf("{0}", &[Value::Int(-15)]), "-15");
+    assert_eq!(sf("{0}{1}", &[Value::Int(-15), s("abc")]), "-15abc");
+    assert_eq!(sf("{{", &[]), "{");
+    assert_eq!(sf("}}", &[]), "}");
+    assert_eq!(sf("{{}}", &[]), "{}");
+    assert_eq!(sf("{{{0}}}", &[Value::Int(123)]), "{123}");
+    assert_eq!(sf("{{{{0}}}}", &[]), "{{0}}");
+    assert_eq!(sf("}}{{", &[]), "}{");
+
+    // string spec edges
+    assert_eq!(sf("{0:.3s}", &[s("abcdef")]), "abc");
+    assert_eq!(sf("{0:.0s}", &[s("abcdef")]), "");
+    assert_eq!(sf("{0:3.2s}", &[s("abc")]), "ab ");
+    assert_eq!(sf("{0:x<7s}", &[s("result")]), "resultx");
+    assert_eq!(sf("{0:>8s}", &[s("result")]), "  result");
+    assert_eq!(sf("{0:^9s}", &[s("result")]), " result  ");
+    assert_eq!(sf("{0:08s}", &[s("result")]), "result00");
+    assert_eq!(sf("{0:>08s}", &[s("result")]), "00result");
+    assert_eq!(sf("{0:^08s}", &[s("result")]), "0result0");
+
+    // huge width (exercises the unbounded zero/space fill, not Rust's capped format!)
+    assert_eq!(sf("{0:10000}", &[s("a")]), format!("a{}", " ".repeat(9999)));
+
+    // null-byte and control-char fill (issue 12546)
+    assert_eq!(sf("{0:\u{0}<6s}", &[s("foo")]), "foo\u{0}\u{0}\u{0}");
+    assert_eq!(sf("{0:\u{0}^6}", &[Value::Int(3)]), "\u{0}\u{0}3\u{0}\u{0}\u{0}");
+    assert_eq!(sf("{0:\u{0}<6}", &[Value::Float(3.14)]), "3.14\u{0}\u{0}");
+}
+
 // str.format errors raised by CPython.
 #[test]
 fn str_format_errors() {

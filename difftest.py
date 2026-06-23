@@ -22,7 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RUST_BIN = os.path.join(HERE, "target", "debug", "diff.exe" if os.name == "nt" else "diff")
 
 US = "\x1f"
-SEED = 20260623
+SEED = int(sys.argv[1]) if len(sys.argv) > 1 else 20260623
 FUZZ_INT = 30000
 FUZZ_STR = 15000
 
@@ -282,14 +282,22 @@ def fuzz(rng):
 
 def rand_float(rng):
     r = rng.random()
-    if r < 0.45:
+    if r < 0.35:
         return rng.uniform(-1e6, 1e6)
-    if r < 0.65:
+    if r < 0.5:
         return rng.uniform(-1.0, 1.0) * 10.0 ** rng.randint(-15, 15)
-    if r < 0.8:
+    if r < 0.62:
         return float(rng.randint(-10**12, 10**12))
+    if r < 0.78:
+        # arbitrary finite doubles from raw bits (denormals, all exponents) - hammers repr
+        x = struct.unpack("<d", struct.pack("<Q", rng.getrandbits(64)))[0]
+        return x if x == x and x not in (float("inf"), float("-inf")) else 0.0
+    if r < 0.88:
+        # near power-of-10 and half-way boundaries (tie-prone)
+        k = rng.randint(-20, 20)
+        return rng.choice([1.0, 5.0, 9.5, 2.5, 0.5, 1.5]) * 10.0 ** k
     return rng.choice([0.0, -0.0, float("inf"), float("-inf"), float("nan"),
-                       0.1, 2.675, 1e16, 1e-5, 123456.789, 0.5, 2.5])
+                       0.1, 2.675, 1e16, 1e-5, 123456.789, 0.5, 2.5, 5e-324, 1.7976931348623157e308])
 
 
 def rand_float_spec(rng):
