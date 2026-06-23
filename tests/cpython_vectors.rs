@@ -5,13 +5,16 @@
 //! Static, Python-free proof (`cargo test`); the exhaustive differential lives in `difftest.py`
 //! (46k+ ops vs the live `format()` builtin).
 
-use pyformat_rs::{format_int, format_str};
+use pyformat_rs::{format_float, format_int, format_str};
 
 fn fi(v: i128, spec: &str) -> String {
     format_int(v, spec).unwrap()
 }
 fn fs(v: &str, spec: &str) -> String {
     format_str(v, spec).unwrap()
+}
+fn ff(v: f64, spec: &str) -> String {
+    format_float(v, spec).unwrap()
 }
 
 // test_types.py: test_int__format__ (decimal, sign, alignment)
@@ -86,6 +89,54 @@ fn str_basic() {
     assert_eq!(fs("hello", "8.3"), "hel     ");
     assert_eq!(fs("hi", "*<8"), "hi******");
     assert_eq!(fs("hi", "08"), "hi000000");
+}
+
+// test_types.py: test_float__format__ (presentation types, sign, exponent)
+#[test]
+fn float_types() {
+    assert_eq!(ff(0.0, "f"), "0.000000");
+    assert_eq!(ff(0.0, ""), "0.0");
+    assert_eq!(ff(0.01, ""), "0.01");
+    assert_eq!(ff(0.01, "g"), "0.01");
+    assert_eq!(ff(1.0, " g"), " 1");
+    assert_eq!(ff(1.0, "+g"), "+1");
+    assert_eq!(ff(1.1234e200, "g"), "1.1234e+200");
+    assert_eq!(ff(1.1234e200, "G"), "1.1234E+200");
+    assert_eq!(ff(1.0, "e"), "1.000000e+00");
+    assert_eq!(ff(-1.0, "E"), "-1.000000E+00");
+    assert_eq!(ff(1.1234e20, "e"), "1.123400e+20");
+    assert_eq!(ff(1e200, "+"), "+1e+200");
+    assert_eq!(ff(1.1e200, "+"), "+1.1e+200");
+}
+
+// test_types.py: test_float__format__ (zero-fill, grouping, precision)
+#[test]
+fn float_padding_grouping() {
+    assert_eq!(ff(1234., "012f"), "01234.000000");
+    assert_eq!(ff(-1234., "013f"), "-01234.000000");
+    assert_eq!(ff(-1234.12341234, "013f"), "-01234.123412");
+    assert_eq!(ff(-123456.12341234, "011.2f"), "-0123456.12");
+    assert_eq!(ff(1.2, "010,.2"), "0,000,001.2");
+    assert_eq!(ff(1234., "013,f"), "01,234.000000");
+    assert_eq!(ff(-1234., "014,f"), "-01,234.000000");
+}
+
+// Documented float edges (Python docs / observed behaviour).
+#[test]
+fn float_edges() {
+    assert_eq!(ff(2.5, ".0f"), "2"); // round half to even
+    assert_eq!(ff(3.5, ".0f"), "4");
+    assert_eq!(ff(0.5, "%"), "50.000000%");
+    assert_eq!(ff(1e16, ""), "1e+16");
+    assert_eq!(ff(1e-5, ""), "1e-05");
+    assert_eq!(ff(0.0001, ""), "0.0001");
+    assert_eq!(ff(-0.0, ".2f"), "-0.00");
+    assert_eq!(ff(-0.001, "z.2f"), "0.00"); // z coerces negative zero
+    assert_eq!(ff(42.0, "#.0f"), "42.");
+    assert_eq!(ff(f64::INFINITY, "f"), "inf");
+    assert_eq!(ff(f64::NEG_INFINITY, ""), "-inf");
+    assert_eq!(ff(f64::NAN, "F"), "NAN");
+    assert_eq!(format_int(1234567, ".2g").unwrap(), "1.2e+06"); // int promotes to float
 }
 
 // Spec errors raised by CPython (ValueError).

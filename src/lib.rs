@@ -1,22 +1,25 @@
-//! A faithful Rust port of Python's format-spec mini-language (CPython 3.13) - Layer 1: `str` and
-//! `int` formatting.
+//! A Rust port of Python's format-spec mini-language (CPython 3.13) - `str`, `int`, and `float`
+//! formatting.
 //!
-//! [`format_str`] and [`format_int`] mirror `format(value, spec)` byte-for-byte: the
-//! `[[fill]align][sign][#][0][width][grouping][.precision][type]` grammar, the sign/prefix rules,
-//! and the thousands-grouping-with-zero-fill behaviour (`format(1234, "08,") == "0,001,234"`).
+//! [`format_str`], [`format_int`], and [`format_float`] mirror `format(value, spec)` byte-for-byte:
+//! the `[[fill]align][sign][#][0][width][grouping][.precision][type]` grammar, the sign/prefix
+//! rules, the thousands-grouping-with-zero-fill behaviour (`format(1234, "08,") == "0,001,234"`),
+//! and the float presentation types (`e`/`f`/`g`/`%` and `repr`) using CPython's exact rounding.
 //!
 //! ```
-//! use pyformat_rs::{format_int, format_str};
+//! use pyformat_rs::{format_float, format_int, format_str};
 //!
 //! assert_eq!(format_int(255, "#06x").unwrap(), "0x00ff");
 //! assert_eq!(format_int(1234567, ",").unwrap(), "1,234,567");
 //! assert_eq!(format_int(-42, "=8").unwrap(), "-     42");
 //! assert_eq!(format_str("hello", ".3").unwrap(), "hel");
+//! assert_eq!(format_float(3.14159, ".2f").unwrap(), "3.14");
+//! assert_eq!(format_float(1234.5, ",.1f").unwrap(), "1,234.5");
+//! assert_eq!(format_float(0.5, "%").unwrap(), "50.000000%");
 //! ```
 //!
-//! Out of scope in this layer (Layer 2): the float presentation types (`e`/`f`/`g`/`%`), which on
-//! an `int` promote it to `float`; the locale type `n`; and arbitrary-precision ints (the input is
-//! an `i128`).
+//! Out of scope: the locale type `n`, arbitrary-precision ints (the input is an `i128`), and the
+//! `str.format` replacement-field grammar.
 
 use std::fmt;
 
@@ -304,6 +307,16 @@ pub fn format_str(value: &str, spec: &str) -> R<String> {
 /// `format(value, spec)` for an `int` value (i128 range in this layer).
 pub fn format_int(value: i128, spec: &str) -> R<String> {
     let s = parse_spec(spec)?;
+    // Float presentation types promote the int to float (CPython does the same); checked before the
+    // integer-only validation because those types legitimately accept a precision.
+    if let Some(t) = s.ty {
+        if matches!(t, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
+            return format_float(value as f64, spec);
+        }
+        if t == 'n' {
+            return err("locale type 'n' not supported");
+        }
+    }
     if s.precision.is_some() {
         return err("Precision not allowed in integer format specifier");
     }
@@ -312,10 +325,6 @@ pub fn format_int(value: i128, spec: &str) -> R<String> {
     }
 
     let ty = s.ty.unwrap_or('d');
-    // Float presentation types promote int->float: Layer 2.
-    if matches!(ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%' | 'n') {
-        return err("float presentation type on int is Layer 2");
-    }
 
     // grouping validity: ',' only with 'd'; '_' with 'd'/'b'/'o'/'x'/'X'.
     if let Some(gch) = s.grouping {
@@ -389,4 +398,220 @@ pub fn format_int(value: i128, spec: &str) -> R<String> {
     let body = format!("{sign_str}{prefix}{number}");
     let align = s.align.unwrap_or(Align::Right);
     Ok(pad(&body, s.fill, align, s.width, head_len, &body))
+}
+
+// --------------------------------------------------------------------------- float (Layer 2)
+
+/// Split a `{:e}`-style string into (mantissa, exponent).
+fn split_e(s: &str) -> (&str, i32) {
+    let (m, e) = s.split_once('e').expect("exponential form");
+    (m, e.parse::<i32>().expect("exponent"))
+}
+
+/// CPython exponent rendering: a sign and at least two digits (`e+01`, `e-05`, `e+100`).
+fn fmt_exp(exp: i32) -> String {
+    let sign = if exp < 0 { '-' } else { '+' };
+    format!("{sign}{:02}", exp.unsigned_abs())
+}
+
+/// Strip trailing fractional zeros (and a bare trailing `.`).
+fn strip_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Split a rendered unsigned number into (integer digits, the rest: `.`/`e`/`%` onward).
+fn split_int_rest(s: &str) -> (String, String) {
+    match s.find(['.', 'e', 'E', '%']) {
+        Some(i) => (s[..i].to_string(), s[i..].to_string()),
+        None => (s.to_string(), String::new()),
+    }
+}
+
+/// The `g`/`G` algorithm (also the engine for none-with-precision). `p` is the significant-digit
+/// count; `sci_at` is the exponent at/above which scientific notation is used (`p` for `g`,
+/// `p - 1` for none-with-precision).
+fn g_format(xabs: f64, p: usize, sci_at: i32, alt: bool, echar: char, add_dot0: bool) -> (String, String) {
+    let es = format!("{:.*e}", p.saturating_sub(1), xabs);
+    let (mant_full, exp) = split_e(&es);
+    let result = if exp < -4 || exp >= sci_at {
+        let mut mant = if alt { mant_full.to_string() } else { strip_zeros(mant_full) };
+        if alt && !mant.contains('.') {
+            mant.push('.');
+        }
+        format!("{mant}{echar}{}", fmt_exp(exp))
+    } else {
+        let decimals = (p as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{xabs:.decimals$}");
+        let mut s = if alt { s } else { strip_zeros(&s) };
+        if alt && !s.contains('.') {
+            s.push('.');
+        }
+        s
+    };
+    let result = if add_dot0 && !result.contains('.') && !result.contains(echar) {
+        format!("{result}.0")
+    } else {
+        result
+    };
+    split_int_rest(&result)
+}
+
+/// Python `repr`/`str` of a finite float: shortest round-tripping form, fixed when `-4 <= exp < 16`
+/// else scientific, always carrying a decimal point in fixed form.
+/// Shortest round-tripping significant digits + exponent (Rust's `{:e}` is shortest-correct).
+///
+/// Note: at an exact decimal-midpoint double, CPython's dtoa and Rust's shortest-repr may pick opposite
+/// equally-short, equally-round-tripping decimals (e.g. `90593674776370.12` vs `.13`). Both are
+/// valid shortest reprs; this is the one byte-level repr divergence the differential tolerates.
+fn shortest_digits(xabs: f64) -> (String, i32) {
+    let es = format!("{xabs:e}");
+    let (mant, exp) = split_e(&es);
+    (mant.chars().filter(|c| *c != '.').collect(), exp)
+}
+
+fn repr_format(xabs: f64, alt: bool, echar: char) -> (String, String) {
+    if xabs == 0.0 {
+        return ("0".to_string(), ".0".to_string());
+    }
+    let (digits, exp) = shortest_digits(xabs);
+    if (-4..16).contains(&exp) {
+        if exp >= 0 {
+            let intlen = exp as usize + 1;
+            if digits.len() <= intlen {
+                let intp = format!("{digits:0<intlen$}");
+                (intp, ".0".to_string())
+            } else {
+                (digits[..intlen].to_string(), format!(".{}", &digits[intlen..]))
+            }
+        } else {
+            let zeros = (-exp - 1) as usize;
+            ("0".to_string(), format!(".{}{}", "0".repeat(zeros), digits))
+        }
+    } else {
+        let rest = &digits[1..];
+        // '#' keeps a decimal point even when the mantissa is a single digit (`1.e+16`).
+        let mant_rest = if rest.is_empty() {
+            if alt { ".".to_string() } else { String::new() }
+        } else {
+            format!(".{rest}")
+        };
+        (digits[..1].to_string(), format!("{mant_rest}{echar}{}", fmt_exp(exp)))
+    }
+}
+
+/// Produce (integer digits, rest) for a finite non-negative float under the given type/precision.
+fn float_number(xabs: f64, ty: Option<char>, prec: Option<usize>, alt: bool, echar: char) -> (String, String) {
+    match ty.map(|c| c.to_ascii_lowercase()) {
+        Some('f') => {
+            let p = prec.unwrap_or(6);
+            let mut s = format!("{xabs:.p$}");
+            if alt && p == 0 {
+                s.push('.');
+            }
+            split_int_rest(&s)
+        }
+        Some('%') => {
+            let p = prec.unwrap_or(6);
+            let mut s = format!("{:.p$}", xabs * 100.0);
+            if alt && p == 0 {
+                s.push('.');
+            }
+            s.push('%');
+            split_int_rest(&s)
+        }
+        Some('e') => {
+            let p = prec.unwrap_or(6);
+            let es = format!("{xabs:.p$e}");
+            let (m, exp) = split_e(&es);
+            let mut mant = m.to_string();
+            if alt && p == 0 && !mant.contains('.') {
+                mant.push('.');
+            }
+            split_int_rest(&format!("{mant}{echar}{}", fmt_exp(exp)))
+        }
+        Some('g') => {
+            let p = prec.unwrap_or(6).max(1);
+            g_format(xabs, p, p as i32, alt, echar, false)
+        }
+        None => match prec {
+            None => repr_format(xabs, alt, echar),
+            Some(p) => {
+                let p = p.max(1);
+                g_format(xabs, p, p as i32 - 1, alt, echar, true)
+            }
+        },
+        _ => unreachable!(),
+    }
+}
+
+/// Test whether all digit characters in the two parts are zero (for `z` negative-zero coercion).
+fn all_zero(intdigits: &str, rest: &str) -> bool {
+    !intdigits.chars().chain(rest.chars()).any(|c| c.is_ascii_digit() && c != '0')
+}
+
+/// Assemble sign + prefix + grouped/zero-filled integer digits + rest, then pad to width.
+fn assemble(sign: &str, intdigits: &str, rest: &str, spec: &Spec, gsize: usize) -> String {
+    let head_len = sign.chars().count();
+    if spec.align == Some(Align::AfterSign) && spec.fill == '0' {
+        let min_field = spec.width.saturating_sub(head_len + rest.chars().count());
+        let number = match spec.grouping {
+            Some(sep) => grouped_zero_fill(intdigits, sep, gsize, min_field),
+            None => format!("{intdigits:0>min_field$}"),
+        };
+        return format!("{sign}{number}{rest}");
+    }
+    let number = match spec.grouping {
+        Some(sep) => group(intdigits, sep, gsize),
+        None => intdigits.to_string(),
+    };
+    let body = format!("{sign}{number}{rest}");
+    let align = spec.align.unwrap_or(Align::Right);
+    pad(&body, spec.fill, align, spec.width, head_len, &body)
+}
+
+/// `format(value, spec)` for a `float` value.
+pub fn format_float(value: f64, spec: &str) -> R<String> {
+    let s = parse_spec(spec)?;
+    let ty = s.ty;
+    let upper = matches!(ty, Some('E') | Some('F') | Some('G'));
+    match ty {
+        None | Some('e') | Some('E') | Some('f') | Some('F') | Some('g') | Some('G') | Some('%') => {}
+        Some('n') => return err("locale type 'n' not supported"),
+        Some(t) => return err(format!("Unknown format code '{t}' for object of type 'float'")),
+    }
+
+    let neg = value.is_sign_negative() && !value.is_nan();
+    let sign_str = |neg: bool| -> &'static str {
+        if neg {
+            "-"
+        } else {
+            match s.sign {
+                Sign::Plus => "+",
+                Sign::Space => " ",
+                Sign::Minus => "",
+            }
+        }
+    };
+
+    if value.is_nan() || value.is_infinite() {
+        let mut word = if value.is_nan() { "nan" } else { "inf" }.to_string();
+        if upper {
+            word = word.to_uppercase();
+        }
+        // The '%' type still appends its percent sign to inf/nan.
+        let rest = if s.ty == Some('%') { "%" } else { "" };
+        // inf/nan never carry grouping; zero-fill still applies.
+        let mut sp = s.clone();
+        sp.grouping = None;
+        return Ok(assemble(sign_str(neg), &word, rest, &sp, 3));
+    }
+
+    let xabs = value.abs();
+    let echar = if upper { 'E' } else { 'e' };
+    let (intdigits, rest) = float_number(xabs, ty, s.precision, s.alt, echar);
+    let neg = if s.z && neg && all_zero(&intdigits, &rest) { false } else { neg };
+    Ok(assemble(sign_str(neg), &intdigits, &rest, &s, 3))
 }

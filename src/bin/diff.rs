@@ -4,7 +4,7 @@
 
 use std::io::{self, Read, Write};
 
-use pyformat_rs::{format_int, format_str};
+use pyformat_rs::{format_float, format_int, format_str};
 
 const US: char = '\u{1f}';
 
@@ -23,6 +23,11 @@ fn dispatch(line: &str) -> String {
             Err(_) => "ERR".to_string(), // out of i128 range: Layer 1 bound
         },
         "fs" => wrap(format_str(f[1], f[2])),
+        // float passed as raw IEEE-754 bits (decimal u64) so both sides see identical values.
+        "ff" => match f[1].parse::<u64>() {
+            Ok(bits) => wrap(format_float(f64::from_bits(bits), f[2])),
+            Err(_) => "ERR".to_string(),
+        },
         other => panic!("unknown op {other:?}"),
     }
 }
