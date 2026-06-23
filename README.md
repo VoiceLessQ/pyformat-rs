@@ -86,17 +86,32 @@ dtoa and Rust's shortest-repr can pick opposite (equally short, equally round-tr
 ## Verification
 
 1. **CPython's own test vectors** - [`tests/cpython_vectors.rs`](tests/cpython_vectors.rs) lifts
-   rows straight from `Lib/test/test_types.py::test_int__format__` and `test_float__format__`. Run
-   with `cargo test`, no Python needed.
+   rows straight from CPython's test suite: `Lib/test/test_types.py::test_int__format__` and
+   `test_float__format__`, and `Lib/test/test_str.py::test_format` (positional fields, brace
+   escapes, string-spec edges, null-byte fill, a 10000-wide field). Run with `cargo test`, no Python
+   needed.
 2. **A live differential** - [`difftest.py`](difftest.py) throws a curated corpus plus a seeded
-   fuzzer (random specs and values, floats passed as raw IEEE-754 bits) at both this crate and
-   Python's `format()` (CPython 3.13.1) and fails on any divergence. The current suite runs 112k+
-   operations.
+   fuzzer at both this crate and Python's `format()` / `str.format` (CPython 3.13.1) and fails on
+   any divergence. Each run is **112,000+ operations** across all four entry points:
+
+   | entry point | ops/run |
+   |---|---|
+   | `format_float` (`ff`) | ~41,000 |
+   | `format_int` (`fi`) | ~31,000 |
+   | `str_format` (`sf`) | ~25,000 |
+   | `format_str` (`fs`) | ~15,000 |
+
+   About 77k produce real output (checked byte-for-byte) and 26k exercise error paths (the crate
+   raises exactly where CPython does). Floats are passed as raw IEEE-754 bits, and the fuzzer draws
+   arbitrary finite doubles (denormals, every exponent, power-of-10 and half-way boundaries) to
+   hammer the rounding and `repr` paths. The suite is **seedable** and has been run clean across 20+
+   seeds (~2.4M operations); that adversarial pass is what caught the `%`-overflow-to-infinity bug.
 
 ```sh
-cargo test
+cargo test                 # CPython-derived vectors, no Python needed
 cargo build
-python difftest.py     # prints "ALL MATCH - N operations agree ..." on success
+python difftest.py         # default seed; prints "ALL MATCH - N operations agree ..."
+python difftest.py 42      # any seed, for a multi-seed CI sweep
 ```
 
 ## License
