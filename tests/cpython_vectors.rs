@@ -5,6 +5,9 @@
 //! Static, Python-free proof (`cargo test`); the exhaustive differential lives in `difftest.py`
 //! (46k+ ops vs the live `format()` builtin).
 
+// The 3.14 / 3.14159 literals are verbatim CPython test values, not PI approximations.
+#![allow(clippy::approx_constant)]
+
 use pyformat_rs::{Value, format_float, format_int, format_str, str_format};
 
 fn fi(v: i128, spec: &str) -> String {
