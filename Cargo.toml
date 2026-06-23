@@ -1,0 +1,13 @@
+[package]
+name = "pyformat-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A faithful Rust port of Python's format() mini-language: format-spec parsing and int/str formatting, byte-for-byte compatible with CPython."
+license = "MIT"
+repository = "https://github.com/VoiceLessQ/pyformat-rs"
+readme = "README.md"
+keywords = ["format", "python", "cpython", "str-format", "formatting"]
+categories = ["text-processing", "value-formatting"]
+exclude = ["/difftest.py", "/src/bin", "/.github"]
+
+[dependencies]
