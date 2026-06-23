@@ -1,25 +1,28 @@
-//! A Rust port of Python's format-spec mini-language (CPython 3.13) - `str`, `int`, and `float`
-//! formatting.
+//! A Rust port of Python's string formatting (CPython 3.13): the `format(value, spec)` mini-language
+//! for `str`/`int`/`float`, plus the `str.format` replacement-field grammar.
 //!
 //! [`format_str`], [`format_int`], and [`format_float`] mirror `format(value, spec)` byte-for-byte:
 //! the `[[fill]align][sign][#][0][width][grouping][.precision][type]` grammar, the sign/prefix
 //! rules, the thousands-grouping-with-zero-fill behaviour (`format(1234, "08,") == "0,001,234"`),
 //! and the float presentation types (`e`/`f`/`g`/`%` and `repr`) using CPython's exact rounding.
+//! [`str_format`] mirrors `"...".format(*args, **kwargs)`: positional / keyword / auto field
+//! numbering, `!r`/`!s`/`!a` conversions, nested replacement fields in the spec, and brace escapes.
 //!
 //! ```
-//! use pyformat_rs::{format_float, format_int, format_str};
+//! use pyformat_rs::{format_float, format_int, format_str, str_format, Value};
 //!
 //! assert_eq!(format_int(255, "#06x").unwrap(), "0x00ff");
-//! assert_eq!(format_int(1234567, ",").unwrap(), "1,234,567");
 //! assert_eq!(format_int(-42, "=8").unwrap(), "-     42");
 //! assert_eq!(format_str("hello", ".3").unwrap(), "hel");
 //! assert_eq!(format_float(3.14159, ".2f").unwrap(), "3.14");
-//! assert_eq!(format_float(1234.5, ",.1f").unwrap(), "1,234.5");
 //! assert_eq!(format_float(0.5, "%").unwrap(), "50.000000%");
+//!
+//! let args = [Value::Int(7), Value::Str("hi".into())];
+//! assert_eq!(str_format("{0} {1!r:>6}", &args, &[]).unwrap(), "7   'hi'");
 //! ```
 //!
-//! Out of scope: the locale type `n`, arbitrary-precision ints (the input is an `i128`), and the
-//! `str.format` replacement-field grammar.
+//! Out of scope: the locale type `n`, arbitrary-precision ints (the input is an `i128`),
+//! precision above 9999, and `[index]` / `.attr` access in replacement fields.
 
 use std::fmt;
 
@@ -196,6 +199,19 @@ fn parse_spec(spec: &str) -> R<Spec> {
     })
 }
 
+/// Left-pad `s` with `'0'` to `width` chars (manual, so width is unbounded - Rust's `format!` width
+/// panics above ~16384, but Python places no such limit).
+fn zfill_left(s: &str, width: usize) -> String {
+    let cur = s.chars().count();
+    if cur >= width {
+        return s.to_string();
+    }
+    let mut o = String::with_capacity(width);
+    o.extend(std::iter::repeat_n('0', width - cur));
+    o.push_str(s);
+    o
+}
+
 /// Insert `sep` every `g` characters of `s`, counting from the right.
 fn group(s: &str, sep: char, g: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -222,8 +238,7 @@ fn grouped_zero_fill(digits: &str, sep: char, g: usize, min_field: usize) -> Str
         }
         d += 1;
     }
-    let padded = format!("{digits:0>d$}");
-    group(&padded, sep, g)
+    group(&zfill_left(digits, d), sep, g)
 }
 
 fn pad(core: &str, fill: char, align: Align, width: usize, sign_prefix_len: usize, body: &str) -> String {
@@ -386,7 +401,7 @@ pub fn format_int(value: i128, spec: &str) -> R<String> {
         let min_field = s.width.saturating_sub(head_len);
         let number = match s.grouping {
             Some(sep) => grouped_zero_fill(&digits, sep, gsize, min_field),
-            None => format!("{digits:0>min_field$}"),
+            None => zfill_left(&digits, min_field),
         };
         return Ok(format!("{sign_str}{prefix}{number}"));
     }
@@ -559,7 +574,7 @@ fn assemble(sign: &str, intdigits: &str, rest: &str, spec: &Spec, gsize: usize) 
         let min_field = spec.width.saturating_sub(head_len + rest.chars().count());
         let number = match spec.grouping {
             Some(sep) => grouped_zero_fill(intdigits, sep, gsize, min_field),
-            None => format!("{intdigits:0>min_field$}"),
+            None => zfill_left(intdigits, min_field),
         };
         return format!("{sign}{number}{rest}");
     }
@@ -575,6 +590,11 @@ fn assemble(sign: &str, intdigits: &str, rest: &str, spec: &Spec, gsize: usize) 
 /// `format(value, spec)` for a `float` value.
 pub fn format_float(value: f64, spec: &str) -> R<String> {
     let s = parse_spec(spec)?;
+    // Rust's `format!` precision panics above ~16384; cap well below that. Python supports larger
+    // precisions (padding with zeros); that range is a documented bound here.
+    if s.precision.is_some_and(|p| p > 9999) {
+        return err("precision too large (bounded to 9999 in this port)");
+    }
     let ty = s.ty;
     let upper = matches!(ty, Some('E') | Some('F') | Some('G'));
     match ty {
@@ -614,4 +634,237 @@ pub fn format_float(value: f64, spec: &str) -> R<String> {
     let (intdigits, rest) = float_number(xabs, ty, s.precision, s.alt, echar);
     let neg = if s.z && neg && all_zero(&intdigits, &rest) { false } else { neg };
     Ok(assemble(sign_str(neg), &intdigits, &rest, &s, 3))
+}
+
+// --------------------------------------------------------------------------- str.format (Layer 3)
+
+/// A scalar value usable as a `str.format` argument. Mirrors the common Python argument types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Int(i128),
+    Float(f64),
+    Str(String),
+    Bool(bool),
+    None,
+}
+
+fn str_of(v: &Value) -> String {
+    match v {
+        Value::Int(n) => n.to_string(),
+        Value::Float(x) => format_float(*x, "").unwrap(),
+        Value::Str(s) => s.clone(),
+        Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+        Value::None => "None".to_string(),
+    }
+}
+
+/// Python `str` repr (`ascii_mode` additionally escapes non-ASCII, like `ascii()`).
+fn py_str_repr(s: &str, ascii_mode: bool) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+    let mut out = String::new();
+    out.push(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(quote);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if c.is_ascii() => out.push(c),
+            c if !ascii_mode && !c.is_control() => out.push(c),
+            c => {
+                let cp = c as u32;
+                if cp <= 0xff {
+                    out.push_str(&format!("\\x{cp:02x}"));
+                } else if cp <= 0xffff {
+                    out.push_str(&format!("\\u{cp:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{cp:08x}"));
+                }
+            }
+        }
+    }
+    out.push(quote);
+    out
+}
+
+fn repr_of(v: &Value, ascii_mode: bool) -> String {
+    match v {
+        Value::Str(s) => py_str_repr(s, ascii_mode),
+        other => str_of(other),
+    }
+}
+
+/// `format(value, spec)` dispatched by the value's type (no conversion applied).
+fn format_typed(v: &Value, spec: &str) -> R<String> {
+    match v {
+        Value::Int(n) => format_int(*n, spec),
+        Value::Float(x) => format_float(*x, spec),
+        Value::Str(s) => format_str(s, spec),
+        Value::Bool(b) => {
+            if spec.is_empty() {
+                Ok(if *b { "True" } else { "False" }.to_string())
+            } else {
+                format_int(if *b { 1 } else { 0 }, spec)
+            }
+        }
+        Value::None => {
+            if spec.is_empty() {
+                Ok("None".to_string())
+            } else {
+                err("unsupported format string passed to NoneType.__format__")
+            }
+        }
+    }
+}
+
+fn render_field(v: &Value, conversion: Option<char>, spec: &str) -> R<String> {
+    match conversion {
+        None => format_typed(v, spec),
+        Some('s') => format_str(&str_of(v), spec),
+        Some('r') => format_str(&repr_of(v, false), spec),
+        Some('a') => format_str(&repr_of(v, true), spec),
+        Some(c) => err(format!("Unknown conversion specifier {c}")),
+    }
+}
+
+/// Field-numbering state shared across a whole `format` call (including nested specs).
+struct Numbering {
+    auto: usize,
+    mode: Mode,
+}
+
+#[derive(PartialEq)]
+enum Mode {
+    Unset,
+    Auto,
+    Manual,
+}
+
+impl Numbering {
+    fn resolve<'a>(
+        &mut self,
+        name: &str,
+        args: &'a [Value],
+        kwargs: &'a [(String, Value)],
+    ) -> R<&'a Value> {
+        if name.is_empty() {
+            if self.mode == Mode::Manual {
+                return err("cannot switch from manual field specification to automatic field numbering");
+            }
+            self.mode = Mode::Auto;
+            let idx = self.auto;
+            self.auto += 1;
+            args.get(idx).ok_or_else(|| FormatError(format!("Replacement index {idx} out of range")))
+        } else if let Ok(idx) = name.parse::<usize>() {
+            if self.mode == Mode::Auto {
+                return err("cannot switch from automatic field numbering to manual field specification");
+            }
+            self.mode = Mode::Manual;
+            args.get(idx).ok_or_else(|| FormatError(format!("Replacement index {idx} out of range")))
+        } else {
+            // `[...]` / `.attr` access is not supported in this layer.
+            if name.contains(['[', '.']) {
+                return err("attribute/index access not supported");
+            }
+            kwargs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v)
+                .ok_or_else(|| FormatError(format!("'{name}'")))
+        }
+    }
+}
+
+/// Read the content of a replacement field (between the outer braces), brace-depth aware.
+fn read_field(chars: &[char], start: usize) -> R<(String, usize)> {
+    let mut depth = 1;
+    let mut i = start;
+    let mut content = String::new();
+    while i < chars.len() {
+        match chars[i] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((content, i + 1));
+                }
+            }
+            _ => {}
+        }
+        content.push(chars[i]);
+        i += 1;
+    }
+    err("Single '{' encountered in format string")
+}
+
+fn vformat(
+    template: &str,
+    args: &[Value],
+    kwargs: &[(String, Value)],
+    state: &mut Numbering,
+    depth: usize,
+) -> R<String> {
+    if depth > 2 {
+        return err("Max string recursion exceeded");
+    }
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '{' if i + 1 < chars.len() && chars[i + 1] == '{' => {
+                out.push('{');
+                i += 2;
+            }
+            '}' if i + 1 < chars.len() && chars[i + 1] == '}' => {
+                out.push('}');
+                i += 2;
+            }
+            '}' => return err("Single '}' encountered in format string"),
+            '{' => {
+                let (content, next) = read_field(&chars, i + 1)?;
+                i = next;
+                // Split name[!conv] from :spec at the first ':'.
+                let (name_conv, spec) = match content.split_once(':') {
+                    Some((nc, sp)) => (nc, sp.to_string()),
+                    None => (content.as_str(), String::new()),
+                };
+                let (name, conversion) = match name_conv.split_once('!') {
+                    Some((n, c)) => {
+                        let cc: Vec<char> = c.chars().collect();
+                        if cc.len() != 1 {
+                            return err("conversion must be one character");
+                        }
+                        (n, Some(cc[0]))
+                    }
+                    None => (name_conv, None),
+                };
+                let value = state.resolve(name, args, kwargs)?.clone();
+                let resolved_spec = if spec.contains('{') {
+                    vformat(&spec, args, kwargs, state, depth + 1)?
+                } else {
+                    spec
+                };
+                out.push_str(&render_field(&value, conversion, &resolved_spec)?);
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `template.format(*args, **kwargs)` for scalar [`Value`] arguments.
+pub fn str_format(template: &str, args: &[Value], kwargs: &[(String, Value)]) -> R<String> {
+    let mut state = Numbering { auto: 0, mode: Mode::Unset };
+    vformat(template, args, kwargs, &mut state, 0)
 }

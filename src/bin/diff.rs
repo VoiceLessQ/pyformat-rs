@@ -4,9 +4,23 @@
 
 use std::io::{self, Read, Write};
 
-use pyformat_rs::{format_float, format_int, format_str};
+use pyformat_rs::{Value, format_float, format_int, format_str, str_format};
 
 const US: char = '\u{1f}';
+
+/// Decode a tagged scalar: i<int>, f<u64 bits>, s<str>, T, F, N.
+fn parse_val(tok: &str) -> Value {
+    let (tag, rest) = tok.split_at(1);
+    match tag {
+        "i" => Value::Int(rest.parse().expect("int")),
+        "f" => Value::Float(f64::from_bits(rest.parse::<u64>().expect("bits"))),
+        "s" => Value::Str(rest.to_string()),
+        "T" => Value::Bool(true),
+        "F" => Value::Bool(false),
+        "N" => Value::None,
+        _ => panic!("bad value tag {tok:?}"),
+    }
+}
 
 fn wrap(r: Result<String, impl std::fmt::Debug>) -> String {
     match r {
@@ -28,6 +42,23 @@ fn dispatch(line: &str) -> String {
             Ok(bits) => wrap(format_float(f64::from_bits(bits), f[2])),
             Err(_) => "ERR".to_string(),
         },
+        // sf <template> <args> <kwargs>: args US-joined tagged values; kwargs US-joined name=value.
+        "sf" => {
+            let args: Vec<Value> =
+                if f[2].is_empty() { vec![] } else { f[2].split(US).map(parse_val).collect() };
+            let kwargs: Vec<(String, Value)> = if f[3].is_empty() {
+                vec![]
+            } else {
+                f[3]
+                    .split(US)
+                    .map(|kv| {
+                        let (k, v) = kv.split_once('=').expect("kwarg");
+                        (k.to_string(), parse_val(v))
+                    })
+                    .collect()
+            };
+            wrap(str_format(f[1], &args, &kwargs))
+        }
         other => panic!("unknown op {other:?}"),
     }
 }

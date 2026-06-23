@@ -5,7 +5,7 @@
 //! Static, Python-free proof (`cargo test`); the exhaustive differential lives in `difftest.py`
 //! (46k+ ops vs the live `format()` builtin).
 
-use pyformat_rs::{format_float, format_int, format_str};
+use pyformat_rs::{Value, format_float, format_int, format_str, str_format};
 
 fn fi(v: i128, spec: &str) -> String {
     format_int(v, spec).unwrap()
@@ -137,6 +137,45 @@ fn float_edges() {
     assert_eq!(ff(f64::NEG_INFINITY, ""), "-inf");
     assert_eq!(ff(f64::NAN, "F"), "NAN");
     assert_eq!(format_int(1234567, ".2g").unwrap(), "1.2e+06"); // int promotes to float
+}
+
+// str.format mechanics (Python docs / observed CPython 3.13 behaviour).
+#[test]
+fn str_format_mechanics() {
+    let i = |n| Value::Int(n);
+    let s = |t: &str| Value::Str(t.to_string());
+
+    // auto vs manual numbering, reuse
+    assert_eq!(str_format("{} {} {}", &[i(1), i(2), i(3)], &[]).unwrap(), "1 2 3");
+    assert_eq!(str_format("{0} {1} {0}", &[s("a"), s("b")], &[]).unwrap(), "a b a");
+    // keyword
+    assert_eq!(str_format("{name}", &[], &[("name".into(), s("x"))]).unwrap(), "x");
+    // brace escapes
+    assert_eq!(str_format("{{{0}}}", &[i(5)], &[]).unwrap(), "{5}");
+    // conversions
+    assert_eq!(str_format("{!r}", &[s("hi")], &[]).unwrap(), "'hi'");
+    assert_eq!(str_format("{!a}", &[s("\u{e9}\u{f1}")], &[]).unwrap(), "'\\xe9\\xf1'");
+    assert_eq!(str_format("{!r:>10}", &[s("hi")], &[]).unwrap(), "      'hi'");
+    // nested replacement fields in the spec
+    assert_eq!(str_format("{:{}.{}}", &[Value::Float(3.14159), i(10), i(2)], &[]).unwrap(), "       3.1");
+    assert_eq!(str_format("{0:{1}}", &[i(42), s("#x")], &[]).unwrap(), "0x2a");
+    // bool / None __format__
+    assert_eq!(str_format("{:d}", &[Value::Bool(true)], &[]).unwrap(), "1");
+    assert_eq!(str_format("{}", &[Value::Bool(true)], &[]).unwrap(), "True");
+    assert_eq!(str_format("{}", &[Value::None], &[]).unwrap(), "None");
+}
+
+// str.format errors raised by CPython.
+#[test]
+fn str_format_errors() {
+    assert!(str_format("{0} {}", &[Value::Int(1), Value::Int(2)], &[]).is_err()); // mix manual+auto
+    assert!(str_format("{} {0}", &[Value::Int(1), Value::Int(2)], &[]).is_err()); // mix auto+manual
+    assert!(str_format("{:>5}", &[Value::None], &[]).is_err()); // None with non-empty spec
+    assert!(str_format("{!x}", &[Value::Int(1)], &[]).is_err()); // unknown conversion
+    assert!(str_format("{", &[], &[]).is_err()); // single '{'
+    assert!(str_format("}", &[], &[]).is_err()); // single '}'
+    assert!(str_format("{3}", &[Value::Int(1)], &[]).is_err()); // index out of range
+    assert!(str_format("{missing}", &[], &[]).is_err()); // unknown keyword
 }
 
 // Spec errors raised by CPython (ValueError).

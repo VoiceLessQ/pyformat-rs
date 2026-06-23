@@ -49,9 +49,34 @@ def expect(line):
         if op == "ff":
             v = struct.unpack("<d", struct.pack("<Q", int(f[1])))[0]
             return US + format(v, f[2])
-    except (ValueError, OverflowError):
+        if op == "sf":
+            args = [parse_val(t) for t in f[2].split(US)] if f[2] else []
+            kwargs = {}
+            if f[3]:
+                for kv in f[3].split(US):
+                    name, val = kv.split("=", 1)
+                    kwargs[name] = parse_val(val)
+            return US + f[1].format(*args, **kwargs)
+    except (ValueError, OverflowError, TypeError, IndexError, KeyError):
         return "ERR"
     raise AssertionError(op)
+
+
+def parse_val(tok):
+    t = tok[0]
+    if t == "i":
+        return int(tok[1:])
+    if t == "f":
+        return struct.unpack("<d", struct.pack("<Q", int(tok[1:])))[0]
+    if t == "s":
+        return tok[1:]
+    if t == "T":
+        return True
+    if t == "F":
+        return False
+    if t == "N":
+        return None
+    raise AssertionError(tok)
 
 
 def fbits(x):
@@ -103,7 +128,79 @@ def curated_float():
     for spec in ["e", "f", ".2g", "%", ".3e", "012.2f"]:
         for v in [0, 1, -1, 42, 1234567, -1234567]:
             cmds.append("\t".join(["fi", str(v), spec]))
+
+    cmds += curated_format()
     return cmds
+
+
+def vtag(v):
+    if isinstance(v, bool):
+        return "T" if v else "F"
+    if isinstance(v, int):
+        return "i" + str(v)
+    if isinstance(v, float):
+        return "f" + str(fbits(v))
+    if isinstance(v, str):
+        return "s" + v
+    if v is None:
+        return "N"
+    raise AssertionError(v)
+
+
+def sf_cmd(tmpl, args=(), kwargs=None):
+    a = US.join(vtag(x) for x in args)
+    k = US.join("%s=%s" % (name, vtag(val)) for name, val in (kwargs or {}).items())
+    return "\t".join(["sf", tmpl, a, k])
+
+
+def curated_format():
+    cases = [
+        ("{} {} {}", (1, 2, 3), None),
+        ("{0} {1} {0}", ("a", "b"), None),
+        ("{2} {0}", (1, 2, 3), None),
+        ("{0} {}", (1, 2), None),          # mix -> error
+        ("{} {0}", (1, 2), None),
+        ("{name}", (), {"name": "x"}),
+        ("{0} {name}", (1,), {"name": "y"}),
+        ("{{literal}}", (), None),
+        ("{{{0}}}", (5,), None),
+        ("{!r}", ("hi",), None),
+        ("{!s}", ("hi",), None),
+        ("{!a}", ("hi",), None),
+        ("{!r}", (42,), None),
+        ("{!r}", (1.5,), None),
+        ("{!r}", (True,), None),
+        ("{!r}", (None,), None),
+        ("{:>10}", ("hi",), None),
+        ("{!r:>10}", ("hi",), None),
+        ("{:{}}", ("hi", ">6"), None),
+        ("{:{}.{}}", (3.14159, 10, 2), None),
+        ("{0:{1}}", (42, "#x"), None),
+        ("{:d}", (True,), None),
+        ("{}", (True,), None),
+        ("{:d}", (False,), None),
+        ("{}", (None,), None),
+        ("{:>5}", (None,), None),           # TypeError
+        ("{:d}", (None,), None),            # TypeError
+        ("{:c}", (65,), None),
+        ("{:5d}", (3.0,), None),            # ValueError d on float
+        ("{!x}", (1,), None),               # bad conversion
+        ("{", (), None),                    # unmatched
+        ("}", (), None),
+        ("hello {0}!", ("world",), None),
+        ("{0:,}", (1234567,), None),
+        ("{0:+.2f}", (3.14159,), None),
+        ("{:>{w}}", ("hi",), {"w": 8}),
+        ("{0}{0}{0}", ("x",), None),
+        ("{name!r}", (), {"name": "h'i"}),
+        ("{:.3}", (3.14159,), None),
+        ("{} {} {}", (True, False, None), None),
+        ("{3}", (1, 2), None),              # IndexError
+        ("{missing}", (), None),            # KeyError
+        ("{:{}{}}", (42, ">", 6), None),
+        ("a {} b {} c", (1, "two"), None),
+    ]
+    return [sf_cmd(t, a, k) for (t, a, k) in cases]
 
 
 def rand_int_spec(rng):
@@ -227,6 +324,72 @@ def fuzz_float(rng):
     FUZZ_FLOAT = 40000
     for _ in range(FUZZ_FLOAT):
         cmds.append("\t".join(["ff", str(fbits(rand_float(rng))), rand_float_spec(rng)]))
+
+    cmds += fuzz_format(rng)
+    return cmds
+
+
+def rand_value(rng):
+    # Bounded: a value may be consumed by a nested {} as a width/precision, and huge width/precision
+    # is a documented bound (Rust's format! caps ~16384). Big-number grouping is covered by fi/ff.
+    r = rng.random()
+    if r < 0.32:
+        return rng.randint(-400, 400)
+    if r < 0.52:
+        return round(rng.uniform(-1000, 1000), rng.randint(0, 4))
+    if r < 0.74:
+        # printable ASCII only (no tab / US / newline, which are protocol separators)
+        return "".join(rng.choice("abcXYZ123 .!_'") for _ in range(rng.randint(0, 6)))
+    if r < 0.82:
+        return True
+    if r < 0.88:
+        return False
+    if r < 0.93:
+        return None
+    return rng.choice([0, 1, -1, 3.14, "hi", 255])
+
+
+def rand_field_spec(rng):
+    if rng.random() < 0.45:
+        return ""
+    return ":" + rng.choice(
+        [">10", "<5", "^8", "+.2f", "#x", ".3", "06.2f", ",", "%", "d", "e", "f", "g",
+         "08b", "*^9", ">{}", "<{}", ".{}"]  # last three nest one auto/manual field
+    )
+
+
+def fuzz_format(rng):
+    cmds = []
+    FUZZ_FMT = 25000
+    idents = ["a", "b", "name", "x", "foo", "val", "w"]
+    for _ in range(FUZZ_FMT):
+        mode = rng.choice(["auto", "manual", "kw"])
+        nfields = rng.randint(0, 4)
+        # build a pool of args / kwargs large enough for the fields + any nested specs
+        nargs = rng.randint(nfields + 2, nfields + 5)
+        args = [rand_value(rng) for _ in range(nargs)]
+        knames = rng.sample(idents, rng.randint(1, len(idents)))
+        kwargs = {nm: rand_value(rng) for nm in knames}
+
+        parts = []
+        for _ in range(nfields):
+            if rng.random() < 0.15:
+                parts.append(rng.choice(["{{", "}}", " ", "x", "-"]))
+                continue
+            if mode == "auto":
+                name = ""
+            elif mode == "manual":
+                name = str(rng.randrange(nargs))
+            else:
+                name = rng.choice(knames)
+            conv = rng.choice(["", "!r", "!s", "!a"])
+            spec = rand_field_spec(rng)
+            parts.append("{" + name + conv + spec + "}")
+        tmpl = "".join(parts)
+        # occasionally force a manual/auto mix to exercise the switch error
+        if rng.random() < 0.05:
+            tmpl += "{}{0}"
+        cmds.append(sf_cmd(tmpl, args, kwargs))
     return cmds
 
 

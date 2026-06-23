@@ -1,18 +1,22 @@
 # pyformat-rs
 
-Rust port of Python's
+Rust port of Python's string formatting (CPython 3.13): the
 [format-spec mini-language](https://docs.python.org/3/library/string.html#format-specification-mini-language)
-(CPython 3.13) - `str`, `int`, and `float` formatting. [`format_str`], [`format_int`], and
-[`format_float`] mirror `format(value, spec)` byte-for-byte: the
-`[[fill]align][sign][#][0][width][grouping][.precision][type]` grammar, the sign/prefix rules, the
-thousands-grouping-with-zero-fill behaviour, and the float presentation types using CPython's exact
-rounding. Verified against the live `format()` builtin across 87k+ operations and against CPython's
-own test suite.
+for `str`/`int`/`float`, plus the `str.format` replacement-field grammar. `format_str`,
+`format_int`, and `format_float` mirror `format(value, spec)` byte-for-byte (the full
+`[[fill]align][sign][#][0][width][grouping][.precision][type]` grammar and the float presentation
+types using CPython's exact rounding); `str_format` mirrors `"...".format(*args, **kwargs)`.
+Verified against the live `format()`/`str.format` across 112k+ operations and against CPython's own
+test suite.
 
 ## Usage
 
 ```rust
-use pyformat_rs::{format_float, format_int, format_str};
+use pyformat_rs::{format_float, format_int, format_str, str_format, Value};
+
+// "...".format(*args): positional/keyword/auto numbering, !r/!s/!a, nested specs
+let args = [Value::Int(7), Value::Str("hi".into())];
+assert_eq!(str_format("{0} {1!r:>6}", &args, &[]).unwrap(), "7   'hi'");
 
 assert_eq!(format_int(255, "#06x").unwrap(), "0x00ff");
 assert_eq!(format_int(1234567, ",").unwrap(), "1,234,567");
@@ -48,6 +52,10 @@ Requires a Rust toolchain with 2024-edition support (Rust 1.85 or newer). No dep
   (and their upper-case forms), `z` negative-zero coercion, `#` alternate form, grouping and
   zero-fill on the integer part, and CPython's exact rounding (round-half-even, shortest repr).
 - **`format_str`** - fill + align, width, `.precision` truncation, type `s`, and the `0`-flag fill.
+- **`str_format`** - `"...".format(*args, **kwargs)` over a scalar [`Value`] model
+  (int/float/str/bool/None): positional / keyword / auto field numbering (and the
+  cannot-switch error), `!r`/`!s`/`!a` conversions, nested replacement fields in the spec
+  (`{:{}.{}}`), brace escapes, and the `bool`/`None` `__format__` rules.
 - The full spec parser and every `ValueError` CPython raises for an invalid spec / value (sign on a
   string, precision on an int, `,` with `x`, both `,` and `_`, sign with `c`, ...).
 
@@ -70,8 +78,10 @@ dtoa and Rust's shortest-repr can pick opposite (equally short, equally round-tr
 ## Out of scope
 
 - The locale type `n` (locale-dependent, not portable).
-- Arbitrary-precision ints (the input is an `i128`) and lone-surrogate codepoints for `c`.
-- The `str.format` replacement-field grammar (`{0.attr!r:>10}`) - a later layer.
+- Arbitrary-precision ints (the input is an `i128`), precision above 9999 (Rust's `format!` caps
+  near 16384), and lone-surrogate codepoints for `c`.
+- `[index]` / `.attr` access inside replacement fields (`{0[0]}`, `{0.real}`) - the `str.format`
+  field name is a positional index or keyword name only.
 
 ## Verification
 
@@ -80,7 +90,7 @@ dtoa and Rust's shortest-repr can pick opposite (equally short, equally round-tr
    with `cargo test`, no Python needed.
 2. **A live differential** - [`difftest.py`](difftest.py) throws a curated corpus plus a seeded
    fuzzer (random specs and values, floats passed as raw IEEE-754 bits) at both this crate and
-   Python's `format()` (CPython 3.13.1) and fails on any divergence. The current suite runs 87k+
+   Python's `format()` (CPython 3.13.1) and fails on any divergence. The current suite runs 112k+
    operations.
 
 ```sh
